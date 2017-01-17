@@ -251,6 +251,25 @@ check_range(double value, range *my_range)
 	}
 }
 
+/* Converts the given range into a string */
+char *range_to_string(range *my_range)
+{
+	char *str;
+	char *prefix = (my_range->alert_on == OUTSIDE) ? "" : "@";
+
+	if (!my_range->end_infinity && !my_range->start_infinity) {
+		xasprintf(&str, "%s%.0f:%.0f", prefix, my_range->start, my_range->end);
+	} else if (!my_range->start_infinity && my_range->end_infinity) {
+		xasprintf(&str, "%s%.0f:", prefix, my_range->start);
+	} else if (my_range->start_infinity && !my_range->end_infinity) {
+		xasprintf(&str, "%s~:%.0f", prefix, my_range->end);
+	} else {
+		xasprintf(&str, "%s~:", prefix, my_range->end);
+	}
+
+	return str;
+}
+
 /* Returns status */
 int
 get_status(double value, thresholds *my_thresholds)
