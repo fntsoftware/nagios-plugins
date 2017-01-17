@@ -346,6 +346,7 @@ main (int argc, char **argv)
 	int is_counter=0;
 	int command_interval;
 	int is_ticks= 0;
+	char *showPerf = NULL;
 
 	setlocale (LC_ALL, "");
 	bindtextdomain (PACKAGE, LOCALEDIR);
@@ -628,6 +629,10 @@ main (int argc, char **argv)
 			}
 			response_value[i] = doTransform(strtod (ptr, NULL) + offset);
 			xasprintf (&show, conv, response_value[i]);
+			xasprintf (&showPerf, "%.3f", response_value[i]);
+		}
+		else {
+			showPerf = show;
 		}
 
 		/* Process this block for numeric comparisons */
@@ -652,6 +657,7 @@ main (int argc, char **argv)
 					temp_double = temp_double/duration*rate_multiplier;
 					iresult = get_status(temp_double, thlds[i]);
 					xasprintf (&show, conv, temp_double);
+					showPerf = show;
 				}
 			} else {
 				iresult = get_status(response_value[i], thlds[i]);
@@ -731,7 +737,7 @@ main (int argc, char **argv)
 			}
 			strncat(perfstr, "=", sizeof(perfstr)-strlen(perfstr)-1);
 			len = sizeof(perfstr)-strlen(perfstr)-1;
-			strncat(perfstr, show, len>ptr-show ? ptr-show : len);
+			strncat(perfstr, showPerf, len>ptr-showPerf ? ptr-showPerf : len);
 
 			if (nunits > (size_t)0 && (size_t)i < nunits && unitv[i] != NULL) {
 				xasprintf (&temp_string, "%s", unitv[i]);
