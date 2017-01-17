@@ -37,6 +37,12 @@ const char *email = "devel@nagios-plugins.org";
 #include "utils.h"
 #include "utils_cmd.h"
 
+#include <time.h>
+#include <sys/file.h>
+
+#define PATH_TO_SNMPBULKWALK "/usr/bin/snmpbulkwalk"
+#define PATH_TO_SNMP_CACHE "/var/nagios/snmp_cache"
+
 #define DEFAULT_COMMUNITY "public"
 #define DEFAULT_PORT "161"
 #define DEFAULT_MIBLIST "ALL"
@@ -64,6 +70,8 @@ const char *email = "devel@nagios-plugins.org";
 #define L_RATE_MULTIPLIER CHAR_MAX+2
 #define L_INVERT_SEARCH CHAR_MAX+3
 #define L_OFFSET CHAR_MAX+4
+#define L_CACHE_TIME CHAR_MAX+5
+#define L_MAX_REPETITIONS CHAR_MAX+6
 
 /* Gobble to string - stop incrementing c when c[0] match one of the
  * characters in s */
@@ -153,6 +161,65 @@ double *previous_value;
 size_t previous_size = OID_COUNT_STEP;
 int perf_labels = 1;
 char* ip_version = "";
+int cache_time = 0;
+int max_repetitions = 10;
+FILE *fp;
+
+struct snmp_cache {
+	time_t timestamp;
+	char *file_name;
+	char *address;
+	char *oid;
+	int lines;
+	char **line;
+};
+
+/**
+ * Searches the given oid in the given cache and returns the stored result.
+ *
+ * @param *cache Get the response from this cache
+ * @param *oid Search for this oid
+ * @return The result or NULL
+ */
+char *get_response_from_cache(const struct snmp_cache *cache, const char *oid)
+{
+	char *line = NULL;
+	char *start;
+	char *end;
+	char *index = strrchr(oid, '.') + 1;
+	int i, j, len;
+
+	len = strlen(index);
+	if (verbose > 2)
+		printf("Getting oid %s (index %s) from cache\n", oid, index);
+
+	for (i = 0; i < (*cache).lines; i++)
+	{
+		start = (*cache).line[i];
+		end = strstr(start, delimiter);
+		if (end != NULL)
+		{
+			for (j = 0; start + j < end; j++)
+			{
+				if (start[j] == '.')
+				{
+					start += j + 1;
+					j = 0;
+				}
+			}
+
+			if (end - start == len && strncmp(index, start, len) == 0)
+			{
+				line = (*cache).line[i];
+				if (verbose > 2)
+					printf("Found line %s\n", line);
+				break;
+			}
+		}
+	}
+
+	return line;
+}
 
 static char *fix_snmp_range(char *th)
 {
@@ -209,6 +276,8 @@ main (int argc, char **argv)
 	int is_counter=0;
 	int command_interval;
 	int is_ticks= 0;
+	int store_cache = FALSE;
+	struct snmp_cache cache;
 
 	setlocale (LC_ALL, "");
 	bindtextdomain (PACKAGE, LOCALEDIR);
@@ -307,86 +376,269 @@ main (int argc, char **argv)
 		snmpcmd = strdup (PATH_TO_SNMPGET);
 	}
 
-	/* 10 arguments to pass before context and authpriv options + 1 for host and numoids. Add one for terminating NULL */
-	command_line = calloc (10 + numcontext + numauthpriv + 1 + numoids + 1, sizeof (char *));
-	command_line[0] = snmpcmd;
-	command_line[1] = strdup ("-Le");
-	command_line[2] = strdup ("-t");
-	xasprintf (&command_line[3], "%d", command_interval);
-	command_line[4] = strdup ("-r");
-	xasprintf (&command_line[5], "%d", retries);
-	command_line[6] = strdup ("-m");
-	command_line[7] = strdup (miblist);
-	command_line[8] = "-v";
-	command_line[9] = strdup (proto);
+	if (cache_time > 0)
+	{
+		// load current time
+		time_t cur_time;
+		time(&cur_time);
 
-	for (i = 0; i < numcontext; i++) {
-		command_line[10 + i] = contextargs[i];
-	}
-	
-	for (i = 0; i < numauthpriv; i++) {
-		command_line[10 + numcontext + i] = authpriv[i];
-	}
+		// get oid base
+		cache.address = server_address;
+		cache.oid = strdup(oids[0]);
+		*(strrchr(cache.oid, '.')) = 0;
+		cache.lines = 0;
+		store_cache = TRUE;
 
-	xasprintf (&command_line[10 + numcontext + numauthpriv], "%s:%s", server_address, port);
+		// build filename
+		xasprintf (&cache.file_name, "%s/%s/%s", PATH_TO_SNMP_CACHE, cache.address, cache.oid);
 
-	/* This is just for display purposes, so it can remain a string */
-	xasprintf(&cl_hidden_auth, "%s -Le -t %d -r %d -m %s -v %s %s %s %s:%s",
-		snmpcmd, timeout_interval, retries, strlen(miblist) ? miblist : "''", proto, "[context]", "[authpriv]",
-		server_address, port);
+		if (verbose > 1)
+			printf("Reading cache %s\n", cache.file_name);
 
-	for (i = 0; i < numoids; i++) {
-		command_line[10 + numcontext + numauthpriv + 1 + i] = oids[i];
-		xasprintf(&cl_hidden_auth, "%s %s", cl_hidden_auth, oids[i]);	
-	}
-
-	command_line[10 + numcontext + numauthpriv + 1 + numoids] = NULL;
-
-	if (verbose)
-		printf ("%s\n", cl_hidden_auth);
-
-	/* Set signal handling and alarm */
-	if (signal (SIGALRM, runcmd_timeout_alarm_handler) == SIG_ERR) {
-		usage4 (_("Cannot catch SIGALRM"));
-	}
-	alarm(timeout_interval + 1);
-
-	/* Run the command */
-	return_code = cmd_run_array (command_line, &chld_out, &chld_err, 0);
-
-	/* disable alarm again */
-	alarm(0);
-
-	/* Due to net-snmp sometimes showing stderr messages with poorly formed MIBs,
-	   only return state unknown if return code is non zero or there is no stdout.
-	   Do this way so that if there is stderr, will get added to output, which helps problem diagnosis
-	*/
-	if (return_code != 0)
-		external_error=1;
-	if (chld_out.lines == 0)
-		external_error=1;
-	if (external_error) {
-		if ((chld_err.lines > 0) && strstr(chld_err.line[0], "Timeout")) {
-			printf (_("%s - External command error: %s\n"), state_text(timeout_state), chld_err.line[0]);
-			for (i = 1; i < chld_err.lines; i++) {
-				printf ("%s\n", chld_err.line[i]);
+		fp = fopen(cache.file_name, "r");
+		if (fp != NULL)
+		{
+			// get lock
+			for (i = 0; i < 10; i++)
+			{
+				if (flock(fileno(fp), LOCK_SH) == 0)
+					break;
+				if (verbose > 2)
+					printf("Locking failed: %d\n", errno);
+				sleep(1);
 			}
-			exit (timeout_state);
-		} else if (chld_err.lines > 0) {
-			printf (_("External command error: %s\n"), chld_err.line[0]);
-			for (i = 1; i < chld_err.lines; i++) {
-				printf ("%s\n", chld_err.line[i]);
+
+			if (i < 10)
+			{
+				// read timestamp in the first line
+				if (fscanf(fp, "%d", &cache.timestamp) == 1)
+				{
+					// read timestamp of cache
+					int seconds_valid = cache.timestamp + cache_time - cur_time;
+					if (verbose > 1)
+						printf("Cache valid for %d second(s)\n", seconds_valid);
+
+					// load cache
+					if (seconds_valid > 0)
+					{
+						if (fscanf(fp, "%d", &cache.lines) == 1)
+						{
+							cache.line = calloc(cache.lines, sizeof (char *));
+							i = 0;
+
+							while (i < cache.lines)
+							{
+								response_length = 0;
+								cache.line[i] = NULL;
+								if (getline(&cache.line[i], &response_length, fp) == -1)
+									break;
+								i++;
+							}
+
+							if (i == cache.lines)
+							{
+								chld_out.lines = 1;
+								chld_out.line = calloc(1, sizeof (char *));
+								chld_out.line[0] = get_response_from_cache(&cache, oids[0]);
+
+								if (chld_out.line[0] != NULL)
+								{
+									store_cache = FALSE;
+								}
+								else if (verbose)
+								{
+									printf("Value for oid %s was not found in cache!\n", oids[0]);
+								}
+							}
+							else if (verbose)
+							{
+								printf("Cache file %s is corrupt. Invalid num of lines (expected %d, got %d)!\n", cache.file_name, cache.lines, i);
+							}
+						}
+						else if (verbose)
+						{
+							printf("Cache file %s is corrupt. Expecting num lines in second row!\n", cache.file_name);
+						}
+					}
+					// store new cache
+					else
+					{
+						store_cache = TRUE;
+					}
+				}
+				else if (verbose)
+				{
+					printf("Cache file %s is corrupt. Expecting timestamp in first row!\n", cache.file_name);
+				}
 			}
-			exit (STATE_UNKNOWN);
-		} else {
-			printf(_("External command error with no output (return code: %d)\n"), return_code);
-			exit (STATE_UNKNOWN);
+			else if (verbose)
+			{
+				printf("Cache file %s could not be locked for reading!\n", cache.file_name);
+			}
+
+			fclose(fp);
+		}
+		else if (verbose)
+		{
+			printf("Cache file %s not found\n", cache.file_name);
+		}
+
+		if (store_cache)
+		{
+			// create directory
+			xasprintf (&temp_string, "%s/%s", PATH_TO_SNMP_CACHE, cache.address);
+			mkdir(temp_string, 0700);
+
+			cache.timestamp = cur_time;
+			snmpcmd = PATH_TO_SNMPBULKWALK;
+
+			numcontext = 1;
+			contextargs = calloc (numcontext, sizeof (char *));
+			xasprintf(&contextargs[0], "-Cr%d", max_repetitions);
 		}
 	}
 
-	if (verbose) {
-		for (i = 0; i < chld_out.lines; i++) {
-			printf ("%s\n", chld_out.line[i]);
+	// request new values
+	if (cache_time == 0 || store_cache)
+	{
+		/* 10 arguments to pass before context and authpriv options + 1 for host and numoids. Add one for terminating NULL */
+		command_line = calloc (10 + numcontext + numauthpriv + 1 + numoids + 1, sizeof (char *));
+		command_line[0] = snmpcmd;
+		command_line[1] = strdup ("-Le");
+		command_line[2] = strdup ("-t");
+		xasprintf (&command_line[3], "%d", command_interval);
+		command_line[4] = strdup ("-r");
+		xasprintf (&command_line[5], "%d", retries);
+		command_line[6] = strdup ("-m");
+		command_line[7] = strdup (miblist);
+		command_line[8] = "-v";
+		command_line[9] = strdup (proto);
+
+		for (i = 0; i < numcontext; i++) {
+			command_line[10 + i] = contextargs[i];
+		}
+
+		for (i = 0; i < numauthpriv; i++) {
+			command_line[10 + numcontext + i] = authpriv[i];
+		}
+
+		xasprintf (&command_line[10 + numcontext + numauthpriv], "%s:%s", server_address, port);
+
+		/* This is just for display purposes, so it can remain a string */
+		xasprintf(&cl_hidden_auth, "%s -Le -t %d -r %d -m %s -v %s %s %s %s:%s",
+			snmpcmd, timeout_interval, retries, strlen(miblist) ? miblist : "''", proto, "[context]", "[authpriv]",
+			server_address, port);
+
+		if (store_cache)
+		{
+			command_line[10 + numcontext + numauthpriv + 1] = cache.oid;
+			xasprintf(&cl_hidden_auth, "%s %s", cl_hidden_auth, cache.oid);
+		}
+		else
+		{
+			for (i = 0; i < numoids; i++) {
+				command_line[10 + numcontext + numauthpriv + 1 + i] = oids[i];
+				xasprintf(&cl_hidden_auth, "%s %s", cl_hidden_auth, oids[i]);
+			}
+		}
+
+		command_line[10 + numcontext + numauthpriv + 1 + numoids] = NULL;
+
+		if (verbose)
+			printf ("%s\n", cl_hidden_auth);
+
+		/* Set signal handling and alarm */
+		if (signal (SIGALRM, runcmd_timeout_alarm_handler) == SIG_ERR) {
+			usage4 (_("Cannot catch SIGALRM"));
+		}
+		alarm(timeout_interval + 1);
+
+		/* Run the command */
+		return_code = cmd_run_array (command_line, &chld_out, &chld_err, 0);
+
+		/* disable alarm again */
+		alarm(0);
+
+		/* Due to net-snmp sometimes showing stderr messages with poorly formed MIBs,
+		   only return state unknown if return code is non zero or there is no stdout.
+		   Do this way so that if there is stderr, will get added to output, which helps problem diagnosis
+		*/
+		if (return_code != 0)
+			external_error=1;
+		if (chld_out.lines == 0)
+			external_error=1;
+		if (external_error) {
+			if ((chld_err.lines > 0) && strstr(chld_err.line[0], "Timeout")) {
+				printf (_("%s - External command error: %s\n"), state_text(timeout_state), chld_err.line[0]);
+				for (i = 1; i < chld_err.lines; i++) {
+					printf ("%s\n", chld_err.line[i]);
+				}
+				exit (timeout_state);
+			} else if (chld_err.lines > 0) {
+				printf (_("External command error: %s\n"), chld_err.line[0]);
+				for (i = 1; i < chld_err.lines; i++) {
+					printf ("%s\n", chld_err.line[i]);
+				}
+				exit (STATE_UNKNOWN);
+			} else {
+				printf(_("External command error with no output (return code: %d)\n"), return_code);
+				exit (STATE_UNKNOWN);
+			}
+		}
+
+		if (verbose) {
+			for (i = 0; i < chld_out.lines; i++) {
+				printf ("%s\n", chld_out.line[i]);
+			}
+		}
+
+		if (store_cache)
+		{
+			if (verbose > 1)
+				printf("Writing cache file %s\n", cache.file_name);
+
+			cache.line = chld_out.line;
+			cache.lines = chld_out.lines;
+
+			fp = fopen(cache.file_name, "w");
+			if (fp != NULL)
+			{
+				for (i = 0; i < 10; i++)
+				{
+					if (flock(fileno(fp), LOCK_EX) == 0)
+						break;
+					if (verbose > 2)
+						printf("Locking failed: %d\n", errno);
+					sleep(1);
+				}
+
+				if (i < 10)
+				{
+					fprintf(fp, "%d\n%d\n", cache.timestamp, cache.lines);
+					for (i = 0; i < chld_out.lines; i++)
+					{
+						fprintf(fp, "%s\n", chld_out.line[i]);
+					}
+					fclose(fp);
+				}
+				else if (verbose)
+				{
+					printf("Couldn't get write lock for cache file %s\n", cache.file_name);
+				}
+			}
+			else if (verbose)
+			{
+				printf("Couldn't write cache file %s\n", cache.file_name);
+			}
+
+			chld_out.lines = 1;
+			chld_out.line[0] = get_response_from_cache(&cache, oids[0]);
+
+			if (chld_out.line[0] == NULL)
+			{
+				printf (_("The OID %s was not found using a snmpblukwalk starting with %s\n"), oids[0], cache.oid);
+				exit (STATE_UNKNOWN);
+			}
 		}
 	}
 
@@ -707,6 +959,8 @@ process_arguments (int argc, char **argv)
 		{"perf-oids", no_argument, 0, 'O'},
 		{"ipv4", no_argument, 0, '4'},
 		{"ipv6", no_argument, 0, '6'},
+		{"cache-time", required_argument, 0, L_CACHE_TIME},
+		{"max-repetitions", required_argument, 0, L_MAX_REPETITIONS},
 		{0, 0, 0, 0}
 	};
 
@@ -952,6 +1206,18 @@ process_arguments (int argc, char **argv)
 			if(verbose>2)
 				printf("IPv6 detected! Will pass \"udp6:\" to snmpget.\n");
 			break;
+		case L_CACHE_TIME:
+			if (!is_integer (optarg))
+				usage2 (_("Cache time must be a positive integer"), optarg);
+			else
+				cache_time = atoi(optarg);
+			break;
+		case L_MAX_REPETITIONS:
+			if (!is_integer (optarg))
+				usage2 (_("Max repetitions must be a positive integer"), optarg);
+			else
+				cache_time = atoi(optarg);
+			break;
 		}
 	}
 
@@ -1007,6 +1273,18 @@ validate_arguments ()
 
 	if (proto == NULL)
 		xasprintf(&proto, DEFAULT_PROTOCOL);
+
+	if (cache_time > 0)
+	{
+		if (strcmp(proto, "2c") != 0)
+			die(STATE_UNKNOWN, _("Caching only possible for protocoll 2c (param -P)\n"));
+
+		if (usesnmpgetnext)
+			die(STATE_UNKNOWN, _("Caching not possible with SNMPGETNEXT (param -n)\n"));
+
+		if (numoids > 1)
+			die(STATE_UNKNOWN, _("Caching not possible with multiple oids (param -o)\n"));
+	}
 
 	if ((strcmp(proto,"1") == 0) || (strcmp(proto, "2c")==0)) {	/* snmpv1 or snmpv2c */
 		numauthpriv = 2;
