@@ -750,13 +750,11 @@ main (int argc, char **argv)
 			if (thlds[i]->warning || thlds[i]->critical) {
 				strncat(perfstr, ";", sizeof(perfstr)-strlen(perfstr)-1);
 				if (thlds[i]->warning) {
-					xasprintf (&temp_string, "%.0f", thlds[i]->warning->end);
-					strncat(perfstr, temp_string, sizeof(perfstr)-strlen(perfstr)-1);
+					strncat(perfstr, range_to_string(thlds[i]->warning), sizeof(perfstr)-strlen(perfstr)-1);
 				}
 				strncat(perfstr, ";", sizeof(perfstr)-strlen(perfstr)-1);
 				if (thlds[i]->critical) {
-					xasprintf (&temp_string, "%.0f", thlds[i]->critical->end);
-					strncat(perfstr, temp_string, sizeof(perfstr)-strlen(perfstr)-1);
+					strncat(perfstr, range_to_string(thlds[i]->critical), sizeof(perfstr)-strlen(perfstr)-1);
 				}
 				strncat(perfstr, ";", sizeof(perfstr)-strlen(perfstr)-1);
 			}
